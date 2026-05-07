@@ -1,0 +1,11 @@
+# 密钥
+.env
+
+# 运行时数据
+.seen_msg_ids
+.seen_url_hashes
+bot.log
+
+# Python
+__pycache__/
+*.pyc
