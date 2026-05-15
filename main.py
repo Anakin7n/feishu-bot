@@ -4,6 +4,7 @@
 """
 
 import json
+import logging
 import os
 import re
 import sys
@@ -42,6 +43,32 @@ OPTIONAL_COLUMNS = [
 ]
 
 ALL_COLUMNS = REQUIRED_COLUMNS + OPTIONAL_COLUMNS
+
+# ---- 日志 ----
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.FileHandler(Path(__file__).parent / "bot.log", encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+
+# ---- ApiClient 单例 ----
+
+_api_client = None
+
+def _get_api_client():
+    global _api_client
+    if _api_client is None:
+        _api_client = ApiClient.builder() \
+            .app_id(APP_ID) \
+            .app_secret(APP_SECRET) \
+            .log_level(LogLevel.ERROR) \
+            .build()
+    return _api_client
 
 # ---- 文件名解析 ----
 
@@ -107,20 +134,21 @@ def find_header_row(ws) -> int | None:
 
 
 def find_heji_row(ws, start_row: int) -> int | None:
+    substring_match = None
     for row_idx in range(start_row + 1, ws.max_row + 1):
-        if str(ws.cell(row=row_idx, column=1).value or "").strip() == "合计":
+        val = str(ws.cell(row=row_idx, column=1).value or "").strip()
+        if val == "合计":
             return row_idx
-    for row_idx in range(start_row + 1, ws.max_row + 1):
-        if "合计" in str(ws.cell(row=row_idx, column=1).value or "").strip():
-            return row_idx
-    return None
+        if substring_match is None and "合计" in val:
+            substring_match = row_idx
+    return substring_match
 
 
 def extract_all_data(ws, header_row: int, main_movie: str = "") -> dict | None:
     """提取主电影和对比电影（如有）的数据。"""
     heji_row = find_heji_row(ws, header_row)
     if heji_row is None:
-        print("  [警告] 未找到合计行")
+        logging.warning("未找到合计行")
         return None
 
     # 第一遍：扫描所有列，记录每列出现次数和位置
@@ -143,7 +171,7 @@ def extract_all_data(ws, header_row: int, main_movie: str = "") -> dict | None:
 
     missing = [c for c in REQUIRED_COLUMNS if c not in main_col_map]
     if missing:
-        print(f"  [警告] 缺少必要列: {missing}")
+        logging.warning(f"缺少必要列: {missing}")
         return None
 
     main_data = {name: ws.cell(row=heji_row, column=col).value for name, col in main_col_map.items()}
@@ -176,7 +204,7 @@ def extract_all_data(ws, header_row: int, main_movie: str = "") -> dict | None:
     if not cmp_movie:
         cmp_movie = "对比影片"
 
-    print(f"  对比模式: {main_movie} vs {cmp_movie}")
+    logging.info(f"对比模式: {main_movie} vs {cmp_movie}")
 
     # 映射对比电影列（取第 2 次出现的通用列名 + 对比专用列名）
     cmp_col_map = {}
@@ -330,19 +358,13 @@ def download_file(url: str) -> tuple[str | None, bytes | None]:
 
         return fname, resp.content
     except Exception as e:
-        print(f"  [下载失败] {e}")
+        logging.error(f"下载失败: {e}")
         return None, None
 
 
 # ---- 消息发送 ----
 
 def send_message(chat_id: str, text: str):
-    api_client = ApiClient.builder() \
-        .app_id(APP_ID) \
-        .app_secret(APP_SECRET) \
-        .log_level(LogLevel.ERROR) \
-        .build()
-
     content = json.dumps({"text": text}, ensure_ascii=False)
     req = CreateMessageRequest.builder() \
         .receive_id_type("chat_id") \
@@ -353,49 +375,58 @@ def send_message(chat_id: str, text: str):
             .build()) \
         .build()
 
-    resp = api_client.im.v1.message.create(req)
+    resp = _get_api_client().im.v1.message.create(req)
     if resp.success():
-        print("  已发送到群聊")
+        logging.info("已发送到群聊")
     else:
-        print(f"  [发送失败] code={resp.code}, msg={resp.msg}")
+        logging.error(f"发送失败 code={resp.code}, msg={resp.msg}")
 
 
-# 消息去重（持久化到文件，重启不丢失）
+# 消息去重（内存缓存 + 文件持久化，重启不丢失）
 _SEEN_FILE = Path(__file__).parent / ".seen_msg_ids"
 _SEEN_MAX = 500  # 触发裁剪的阈值
 _SEEN_KEEP = 300  # 裁剪时保留最近条数
 
+_seen_cache: set[str] | None = None
 
-def _load_seen() -> set[str]:
-    """加载所有已处理的 msg_id。"""
+
+def _init_seen():
+    global _seen_cache
+    _seen_cache = set()
     if _SEEN_FILE.exists():
         with open(_SEEN_FILE, "r") as f:
-            return set(line.strip() for line in f if line.strip())
-    return set()
+            for line in f:
+                stripped = line.strip()
+                if stripped:
+                    _seen_cache.add(stripped)
 
 
 def _trim_seen():
-    """按文件追加顺序裁剪，保留最近 _SEEN_KEEP 条（避免 set 无序导致误删新条目）。"""
+    """按文件追加顺序裁剪，保留最近 _SEEN_KEEP 条。"""
     if not _SEEN_FILE.exists():
         return
     with open(_SEEN_FILE, "r") as f:
         all_lines = [line.strip() for line in f if line.strip()]
     if len(all_lines) <= _SEEN_MAX:
         return
+    kept = all_lines[-_SEEN_KEEP:]
     with open(_SEEN_FILE, "w") as f:
-        for line in all_lines[-_SEEN_KEEP:]:
+        for line in kept:
             f.write(line + "\n")
+    global _seen_cache
+    _seen_cache = set(kept)
 
 
 def _is_duplicate(msg_id: str) -> bool:
-    seen = _load_seen()
-    if msg_id in seen:
+    global _seen_cache
+    if _seen_cache is None:
+        _init_seen()
+    if msg_id in _seen_cache:
         return True
-    # 先持久化再裁剪（保证不丢当前 ID）
+    _seen_cache.add(msg_id)
     with open(_SEEN_FILE, "a") as f:
         f.write(msg_id + "\n")
-    seen.add(msg_id)
-    if len(seen) > _SEEN_MAX:
+    if len(_seen_cache) > _SEEN_MAX:
         _trim_seen()
     return False
 
@@ -404,55 +435,49 @@ def _is_duplicate(msg_id: str) -> bool:
 
 def process_urls(urls: list[str]) -> tuple[str, str] | None:
     """下载、解析、生成文案。"""
-    log_path = Path(__file__).parent / "bot.log"
-
-    def log(msg: str):
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(msg + "\n")
-
-    print("开始处理...", flush=True)
+    logging.info("开始处理...")
     entries = []
 
     for url in urls:
-        log(f"  下载: {url}")
+        logging.info(f"下载: {url}")
         fname, content = download_file(url)
         if not content:
-            log(f"  [失败] 下载失败")
+            logging.warning("下载失败")
             continue
 
         safe_name = re.sub(r'[<>:"/\\|?*]', '_', fname)
-        log(f"  文件: {safe_name}")
+        logging.info(f"文件: {safe_name}")
 
         info = parse_filename(safe_name)
         if info is None:
-            log(f"  [警告] 文件名格式不匹配: {safe_name}")
+            logging.warning(f"文件名格式不匹配: {safe_name}")
             continue
 
-        log(f"  影片: {info['movie']}  监控: {info['mon_start']} ~ {info['mon_end']}")
+        logging.info(f"影片: {info['movie']}  监控: {info['mon_start']} ~ {info['mon_end']}")
 
         wb = openpyxl.load_workbook(BytesIO(content), data_only=True)
 
         sheet_name = find_data_sheet(wb)
         if sheet_name is None:
-            log(f"  [警告] 未找到数据 Sheet，可用: {wb.sheetnames}")
+            logging.warning(f"未找到数据 Sheet，可用: {wb.sheetnames}")
             wb.close()
             continue
 
         ws = wb[sheet_name]
-        log(f"  Sheet: {sheet_name}  (max_row={ws.max_row}, max_col={ws.max_column})")
+        logging.info(f"Sheet: {sheet_name}  (max_row={ws.max_row}, max_col={ws.max_column})")
         header_row = find_header_row(ws)
         if header_row is None:
-            log("  [警告] 未找到表头")
+            logging.warning("未找到表头")
             wb.close()
             continue
 
-        log(f"  表头行: {header_row}")
+        logging.info(f"表头行: {header_row}")
 
         all_data = extract_all_data(ws, header_row, info["movie"])
         wb.close()
 
         if all_data is None:
-            log("  [失败] 数据提取失败")
+            logging.warning("数据提取失败")
             continue
 
         info["data"] = all_data["data"]
@@ -460,17 +485,17 @@ def process_urls(urls: list[str]) -> tuple[str, str] | None:
             info["cmp_movie"] = all_data["cmp_movie"]
             info["cmp_data"] = all_data["cmp_data"]
 
-        log(f"  数据: {info['data']}")
+        logging.info(f"数据: {info['data']}")
         if info.get("cmp_movie"):
-            log(f"  对比: {info['cmp_movie']} -> {info['cmp_data']}")
+            logging.info(f"对比: {info['cmp_movie']} -> {info['cmp_data']}")
         entries.append(info)
 
     if len(entries) < 2:
-        log(f"  至少需要 2 个有效文件，当前只有 {len(entries)} 个")
+        logging.warning(f"至少需要 2 个有效文件，当前只有 {len(entries)} 个")
         return None
 
     entries.sort(key=lambda e: e["mon_start"])
-    log("处理完成，生成文案")
+    logging.info("处理完成，生成文案")
     return build_message(entries)
 
 
@@ -479,55 +504,51 @@ def on_message_receive(event: P2ImMessageReceiveV1) -> None:
     msg = event.event.message
     msg_id = msg.message_id
 
-    # 去重（持久化）
     if _is_duplicate(msg_id):
         return
 
-    with open(Path(__file__).parent / "bot.log", "a", encoding="utf-8") as log:
-        chat_id = msg.chat_id
-        msg_type = msg.message_type
+    chat_id = msg.chat_id
+    msg_type = msg.message_type
 
-        log.write(f"[事件] chat_id={chat_id}  msg_type={msg_type}\n")
+    logging.info(f"[事件] chat_id={chat_id}  msg_type={msg_type}")
 
-        if msg_type != "text":
-            log.write(f"[跳过] 非文本消息: {msg_type}\n")
-            return
+    if msg_type != "text":
+        logging.info(f"[跳过] 非文本消息: {msg_type}")
+        return
 
-        content_str = msg.content
-        log.write(f"[内容] {content_str}\n")
+    content_str = msg.content
+    logging.info(f"[内容] {content_str}")
 
-        try:
-            content_json = json.loads(content_str)
-            text = content_json.get("text", "")
-        except (json.JSONDecodeError, AttributeError):
-            text = content_str
+    try:
+        content_json = json.loads(content_str)
+        text = content_json.get("text", "")
+    except (json.JSONDecodeError, AttributeError):
+        text = content_str
 
-        if not text:
-            log.write("[跳过] 空文本\n")
-            return
+    if not text:
+        logging.info("[跳过] 空文本")
+        return
 
-        text = re.sub(r'@\S+\s*', '', text).strip()
-        log.write(f"[文本] {text}\n")
+    text = re.sub(r'@\S+\s*', '', text).strip()
+    logging.info(f"[文本] {text}")
 
-        # 统一分隔符：中文标点 → 空格
-        text = text.replace("；", " ").replace("，", " ").replace("\n", " ")
-        urls = re.findall(r"https?://[^\s]+", text)
-        if not urls:
-            log.write("[跳过] 未发现链接\n")
-            return
+    # 统一分隔符：中文标点 → 空格
+    text = text.replace("；", " ").replace("，", " ").replace(",", " ").replace("\n", " ")
+    urls = re.findall(r"https?://[^\s]+", text)
+    if not urls:
+        logging.info("[跳过] 未发现链接")
+        return
 
-        log.write(f"收到 {len(urls)} 个链接: {urls}\n")
-
-    print(f"收到 {len(urls)} 个链接，处理中...")
+    logging.info(f"收到 {len(urls)} 个链接: {urls}")
     result = process_urls(urls)
     if result:
-        print("文案已生成")
+        logging.info("文案已生成")
         main_msg, summary_msg = result
         send_message(chat_id, main_msg)
-        time.sleep(0.5)  # 避免飞书 API 连续调用限流
+        time.sleep(0.5)
         send_message(chat_id, summary_msg)
     else:
-        print("处理失败，发送错误提示")
+        logging.warning("处理失败，发送错误提示")
         send_message(chat_id, "处理失败：请确认两个链接的 Excel 文件都包含正确的数据 Sheet")
 
 
@@ -535,11 +556,11 @@ def on_message_receive(event: P2ImMessageReceiveV1) -> None:
 
 def main():
     if not APP_ID or not APP_SECRET:
-        print("请先在 .env 中配置 FEISHU_APP_ID 和 FEISHU_APP_SECRET")
+        logging.error("请先在 .env 中配置 FEISHU_APP_ID 和 FEISHU_APP_SECRET")
         sys.exit(1)
 
-    print(f"启动机器人 (App ID: {APP_ID})...")
-    print("监听群聊消息中，可直接发送链接到群里测试\n")
+    logging.info(f"启动机器人 (App ID: {APP_ID})...")
+    logging.info("监听群聊消息中，可直接发送链接到群里测试")
 
     handler = EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message_receive) \
