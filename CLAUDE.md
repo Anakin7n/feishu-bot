@@ -4,8 +4,15 @@
 
 ## 环境
 
-Python 3.12 装在 `%LocalAppData%\Programs\Python\Python312\`，**不在系统 PATH**。
-需要手动指定完整路径，或通过 Windows Terminal 的「飞书 Bot」配置启动。
+- Python 3.12 装在 `%LocalAppData%\Programs\Python\Python312\`，已在系统 PATH
+- 使用虚拟环境 `.venv`，依赖与系统 Python 隔离
+
+### 首次配置
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
 
 ## 入口
 
@@ -13,7 +20,7 @@ Python 3.12 装在 `%LocalAppData%\Programs\Python\Python312\`，**不在系统 
 |------|------|------|
 | 手动启动 | `start.bat` | Windows Terminal + PowerShell，有窗口可看日志 |
 | 自启 | `start_auto.bat` | 任务计划调用，无窗口静默运行 |
-| 直接运行 | `python main.py` | 需指定 Python 完整路径 |
+| 直接运行 | `.\.venv\Scripts\python.exe main.py` | 使用虚拟环境 Python |
 
 ## 部署
 
