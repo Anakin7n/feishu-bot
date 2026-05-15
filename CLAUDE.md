@@ -10,8 +10,9 @@
 D:\feishu-bot\
 ├── main.py              # 机器人主程序（单文件，约 580 行）
 ├── requirements.txt     # Python 依赖
-├── start.bat            # 手动启动（Windows Terminal，有窗口）
+├── start.vbs            # 手动启动（双击弹出 PowerShell 蓝窗口，零闪屏）
 ├── start.ps1            # PowerShell 启动脚本
+├── start.bat            # 手动启动（Windows Terminal，有闪屏，备用）
 ├── start_auto.bat       # 自启脚本（任务计划调用，无窗口）
 ├── start_silent.vbs     # VBS 静默包装器
 ├── .venv/               # Python 虚拟环境（不提交 git）
@@ -56,8 +57,9 @@ FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxx
 
 | 方式 | 文件 | 说明 |
 |------|------|------|
-| 手动启动 | `start.bat` | Windows Terminal + PowerShell，有窗口可看日志 |
+| 手动启动 | `start.vbs` | 双击弹出 PowerShell 蓝窗口，零闪屏 |
 | 自启 | `start_auto.bat` | 任务计划调用，无窗口静默运行 |
+| 备用启动 | `start.bat` | Windows Terminal + PowerShell（有闪屏，备用） |
 | 直接运行 | `.\.venv\Scripts\python.exe main.py` | 使用虚拟环境 Python |
 
 ## 部署
@@ -76,7 +78,7 @@ FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxx
    .\.venv\Scripts\pip install -r requirements.txt
    ```
 4. 填入飞书凭证到 `.env`
-5. 双击 `start.bat` 启动
+5. 双击 `start.vbs` 启动
 
 ## 代码说明
 
