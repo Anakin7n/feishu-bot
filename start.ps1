@@ -1,2 +1,2 @@
 Set-Location "D:\feishu-bot"
-python main.py
+.\.venv\Scripts\python.exe main.py
