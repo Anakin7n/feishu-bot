@@ -4,6 +4,8 @@
 
 飞书群聊机器人，群里发 Excel 链接 → 自动下载 → 解析影片排片数据 → 生成报告文案 → 回复到群里。WebSocket 长连接模式，无需公网 IP。
 
+使用原生 `websockets` + `requests` 替代 lark-oapi SDK，启动从 20+ 秒缩短到 1 秒以内。
+
 ## 文件结构
 
 ```
@@ -111,6 +113,13 @@ FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxx
 
 | 函数 | 作用 |
 |------|------|
+| `_get_token()` | 获取并缓存 tenant_access_token（带过期控制） |
+| `_feishu_post()` | 封装的飞书 HTTP POST 请求（自动带 token） |
+| `send_message()` | 使用 requests 直接调用飞书发送消息 API |
+| `FeishuWsClient` | 精简 WebSocket 客户端，替代 lark_oapi.ws.Client |
+| `encode_ping_frame()` | 自写 protobuf 编码 ping 帧 |
+| `decode_frame()` | 自写 protobuf 解码 WebSocket 帧 |
+| `on_message_receive()` | 消息事件分发（接收 raw dict 替代 P2ImMessageReceiveV1） |
 | `parse_filename()` | 从文件名正则提取影片名、监控时段、提取时间 |
 | `find_data_sheet()` | 三级匹配定位数据 Sheet（精确→模糊→自动探测） |
 | `find_header_row()` | 扫描前 15 行定位含「场次数」的表头行 |
@@ -143,3 +152,33 @@ FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxx
 - 密钥走 `.env`，不硬编码，不提交 git
 - URL 支持中文逗号、英文逗号（带或不带空格）、中文分号、换行分隔
 - 数据 Sheet 优先匹配「综拓开场数据基础模板2」，找不到则自动探测
+
+### WebSocket 长连接架构
+
+不使用 lark-oapi SDK，改用原生 `websockets` 库直连飞书 WebSocket 网关：
+
+```
+FeishuWsClient.start()
+  └─ connect()          ← 无限重连循环
+       └─ _try_connect()
+            ├─ _get_ws_url()   → POST /callback/ws/endpoint 获取 WS 地址
+            ├─ websockets.connect(url, proxy=None)   ← 禁用代理直连
+            ├─ _ping_loop()    → 定时发送 protobuf 编码的 ping 帧
+            └─ _read_loop()
+                 ├─ recv() → decode_frame() → 帧类型判断
+                 └─ type=1: asyncio.create_task(_process_event())
+                              └─ loop.run_in_executor(线程池) → on_message_receive()
+```
+
+关键细节：
+- WS 端点 URL 为 `https://open.feishu.cn/callback/ws/endpoint`
+- 从 URL 参数 `service_id` 提取后用于 ping 帧编码
+- `websockets.connect(url, proxy=None)` 强制禁用系统代理，避免代理引发的连接超时
+- 事件处理用 `loop.run_in_executor` 丢到 `ThreadPoolExecutor(max_workers=2)` 避免阻塞事件循环
+
+### Protobuf 编解码
+
+自写简化版 protobuf 编解码器，替代 lark-oapi 内置的 google protobuf：
+- `encode_ping_frame(service_id)` — 编码 ping 帧（Header: type=ping）
+- `decode_frame(data)` — 解码 WebSocket 接收帧，支持 varint、length-delimited、嵌套 header 解析
+- `frame_type(frame)` / `frame_data_payload(frame)` — 提取帧类型和载荷

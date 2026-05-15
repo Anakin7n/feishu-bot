@@ -1,31 +1,61 @@
 """
 飞书全自动 Excel 处理机器人（长连接模式）
 群里发链接 → 自动下载 → 自动解析 → 自动回复
+使用原生 websockets + requests，启动秒级响应，无需 lark-oapi SDK。
 """
 
+import asyncio
+import concurrent.futures
+import inspect
 import json
 import logging
 import os
 import re
 import sys
 import time
+import traceback
 import urllib.parse
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
 
 import openpyxl
 import requests
+import websockets
 from dotenv import load_dotenv
-
-from lark_oapi import Client as ApiClient, LogLevel
-from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody, P2ImMessageReceiveV1
-from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
-from lark_oapi.ws import Client as WsClient
 
 load_dotenv()
 
 APP_ID = os.getenv("FEISHU_APP_ID", "")
 APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
+
+_FEISHU_DOMAIN = "https://open.feishu.cn"
+_WS_ENDPOINT_URI = "/callback/ws/endpoint"
+
+_token_cache = {"token": "", "expire": 0}
+
+
+def _get_token() -> str:
+    now = time.time()
+    if _token_cache["token"] and now < _token_cache["expire"]:
+        return _token_cache["token"]
+    resp = requests.post(
+        f"{_FEISHU_DOMAIN}/open-apis/auth/v3/tenant_access_token/internal",
+        json={"app_id": APP_ID, "app_secret": APP_SECRET},
+        timeout=10,
+    )
+    data = resp.json()
+    if data.get("code") != 0:
+        raise Exception(f"获取token失败: {data}")
+    _token_cache["token"] = data["tenant_access_token"]
+    _token_cache["expire"] = now + data.get("expire", 7200) - 300
+    return _token_cache["token"]
+
+
+def _feishu_post(path, json_body=None):
+    headers = {"Authorization": f"Bearer {_get_token()}"}
+    resp = requests.post(f"{_FEISHU_DOMAIN}{path}", headers=headers, json=json_body, timeout=30)
+    return resp.json()
 DATA_SHEET = "综拓开场数据基础模板2"
 
 # 备用 Sheet 名和自动探测
@@ -56,19 +86,7 @@ logging.basicConfig(
     ],
 )
 
-# ---- ApiClient 单例 ----
 
-_api_client = None
-
-def _get_api_client():
-    global _api_client
-    if _api_client is None:
-        _api_client = ApiClient.builder() \
-            .app_id(APP_ID) \
-            .app_secret(APP_SECRET) \
-            .log_level(LogLevel.ERROR) \
-            .build()
-    return _api_client
 
 # ---- 文件名解析 ----
 
@@ -366,20 +384,14 @@ def download_file(url: str) -> tuple[str | None, bytes | None]:
 
 def send_message(chat_id: str, text: str):
     content = json.dumps({"text": text}, ensure_ascii=False)
-    req = CreateMessageRequest.builder() \
-        .receive_id_type("chat_id") \
-        .request_body(CreateMessageRequestBody.builder()
-            .receive_id(chat_id)
-            .msg_type("text")
-            .content(content)
-            .build()) \
-        .build()
-
-    resp = _get_api_client().im.v1.message.create(req)
-    if resp.success():
+    resp = _feishu_post(
+        f"/open-apis/im/v1/messages?receive_id_type=chat_id",
+        {"receive_id": chat_id, "msg_type": "text", "content": content},
+    )
+    if resp.get("code") == 0:
         logging.info("已发送到群聊")
     else:
-        logging.error(f"发送失败 code={resp.code}, msg={resp.msg}")
+        logging.error(f"发送失败 code={resp.get('code')}, msg={resp.get('msg')}")
 
 
 # 消息去重（内存缓存 + 文件持久化，重启不丢失）
@@ -499,16 +511,20 @@ def process_urls(urls: list[str]) -> tuple[str, str] | None:
     return build_message(entries)
 
 
-def on_message_receive(event: P2ImMessageReceiveV1) -> None:
-    """接收消息事件回调。"""
-    msg = event.event.message
-    msg_id = msg.message_id
+def on_message_receive(event_data: dict) -> None:
+    event = event_data.get("event", {})
+    msg = event.get("message", {})
+    msg_id = msg.get("message_id", "")
 
     if _is_duplicate(msg_id):
         return
 
-    chat_id = msg.chat_id
-    msg_type = msg.message_type
+    chat_id = msg.get("chat_id", "")
+    msg_type = msg.get("message_type", "")
+
+    sender = event.get("sender", {})
+    if sender.get("sender_type") == "app":
+        return
 
     logging.info(f"[事件] chat_id={chat_id}  msg_type={msg_type}")
 
@@ -516,7 +532,7 @@ def on_message_receive(event: P2ImMessageReceiveV1) -> None:
         logging.info(f"[跳过] 非文本消息: {msg_type}")
         return
 
-    content_str = msg.content
+    content_str = msg.get("content", "{}")
     logging.info(f"[内容] {content_str}")
 
     try:
@@ -532,7 +548,6 @@ def on_message_receive(event: P2ImMessageReceiveV1) -> None:
     text = re.sub(r'@\S+\s*', '', text).strip()
     logging.info(f"[文本] {text}")
 
-    # 统一分隔符：中文标点 → 空格
     text = text.replace("；", " ").replace("，", " ").replace(",", " ").replace("\n", " ")
     urls = re.findall(r"https?://[^\s]+", text)
     if not urls:
@@ -552,6 +567,245 @@ def on_message_receive(event: P2ImMessageReceiveV1) -> None:
         send_message(chat_id, "处理失败：请确认两个链接的 Excel 文件都包含正确的数据 Sheet")
 
 
+# ---- 简化 protobuf frame 编解码 ----
+
+def _pb_varint_size(n: int) -> int:
+    size = 1
+    while n > 127:
+        size += 1
+        n >>= 7
+    return size
+
+
+def _pb_write_varint(buf: bytearray, n: int):
+    while n > 127:
+        buf.append((n & 0x7F) | 0x80)
+        n >>= 7
+    buf.append(n & 0x7F)
+
+
+def _pb_write_tag(buf: bytearray, field: int, wire: int):
+    _pb_write_varint(buf, (field << 3) | wire)
+
+
+def _pb_write_bytes(buf: bytearray, data: bytes):
+    _pb_write_varint(buf, len(data))
+    buf.extend(data)
+
+
+def _pb_write_string(buf: bytearray, field: int, value: str):
+    _pb_write_tag(buf, field, 2)
+    encoded = value.encode("utf-8")
+    _pb_write_bytes(buf, encoded)
+
+
+def _pb_write_uint64(buf: bytearray, field: int, value: int):
+    _pb_write_tag(buf, field, 0)
+    _pb_write_varint(buf, value)
+
+
+def _pb_write_int32(buf: bytearray, field: int, value: int):
+    _pb_write_tag(buf, field, 0)
+    _pb_write_varint(buf, value)
+
+
+def encode_ping_frame(service_id: int) -> bytes:
+    buf = bytearray()
+    header_buf = bytearray()
+    _pb_write_string(header_buf, 1, "type")
+    _pb_write_string(header_buf, 2, "ping")
+    _pb_write_int32(buf, 4, 0)
+    _pb_write_uint64(buf, 2, 0)
+    _pb_write_uint64(buf, 1, 0)
+    _pb_write_tag(buf, 3, 0)
+    _pb_write_varint(buf, service_id)
+    _pb_write_tag(buf, 5, 2)
+    _pb_write_varint(buf, len(header_buf))
+    buf.extend(header_buf)
+    return bytes(buf)
+
+
+def decode_frame(data: bytes) -> dict:
+    result = {}
+    pos = 0
+    while pos < len(data):
+        if pos >= len(data):
+            break
+        tag = data[pos]
+        pos += 1
+        field = tag >> 3
+        wire = tag & 0x07
+        if wire == 0:
+            value = 0
+            shift = 0
+            while pos < len(data):
+                b = data[pos]
+                pos += 1
+                value |= (b & 0x7F) << shift
+                shift += 7
+                if not (b & 0x80):
+                    break
+            result[field] = value
+        elif wire == 2:
+            length = 0
+            shift = 0
+            while pos < len(data):
+                b = data[pos]
+                pos += 1
+                length |= (b & 0x7F) << shift
+                shift += 7
+                if not (b & 0x80):
+                    break
+            value = data[pos:pos + length]
+            pos += length
+            if field == 5:
+                headers = []
+                hpos = 0
+                while hpos < len(value):
+                    htag = value[hpos]
+                    hpos += 1
+                    hfield = htag >> 3
+                    hwire = htag & 0x07
+                    if hwire == 2:
+                        hlen = 0
+                        hshift = 0
+                        while hpos < len(value):
+                            hb = value[hpos]
+                            hpos += 1
+                            hlen |= (hb & 0x7F) << hshift
+                            hshift += 7
+                            if not (hb & 0x80):
+                                break
+                        headers.append((hfield, value[hpos:hpos + hlen].decode("utf-8")))
+                        hpos += hlen
+                result[field] = headers
+            else:
+                result[field] = value
+    return result
+
+
+def frame_type(frame: dict) -> int:
+    return frame.get(4, -1)
+
+
+def frame_data_payload(frame: dict) -> bytes:
+    return frame.get(8, b"")
+
+
+# ---- 精简 WebSocket 客户端 ----
+
+class FeishuWsClient:
+    def __init__(self, app_id: str, app_secret: str):
+        self.app_id = app_id
+        self.app_secret = app_secret
+        self.service_id = ""
+        self._reconnect_interval = 120
+        self._ping_interval = 120
+        self._ws = None
+        self._ws_url = ""
+        self._ping_task = None
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        self._reconnecting = False
+
+    def _get_ws_url(self):
+        resp = requests.post(
+            f"{_FEISHU_DOMAIN}{_WS_ENDPOINT_URI}",
+            headers={"locale": "zh"},
+            json={"AppID": self.app_id, "AppSecret": self.app_secret},
+            timeout=30,
+        )
+        data = resp.json()
+        if data.get("code") != 0:
+            raise Exception(f"获取WS地址失败: {data}")
+        dd = data.get("data", {})
+        if dd.get("ClientConfig"):
+            cc = dd["ClientConfig"]
+            self._reconnect_interval = cc.get("ReconnectInterval", 120)
+            self._ping_interval = cc.get("PingInterval", 120)
+        return dd["URL"]
+
+    async def _ping_loop(self):
+        while True:
+            try:
+                if self._ws is not None:
+                    sid = int(self.service_id) if self.service_id else 0
+                    ping = encode_ping_frame(sid)
+                    await self._ws.send(ping)
+            except Exception as e:
+                logging.warning(f"[ping失败] {e}")
+            await asyncio.sleep(self._ping_interval)
+
+    def _dispatch_sync(self, event_data: dict):
+        try:
+            on_message_receive(event_data)
+        except Exception as e:
+            logging.error(f"[分发异常] {e}")
+            traceback.print_exc()
+
+    async def _process_event(self, event_data: dict):
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(self._executor, self._dispatch_sync, event_data)
+
+    async def _read_loop(self):
+        while True:
+            try:
+                raw = await self._ws.recv()
+                if isinstance(raw, str):
+                    continue
+                frame = decode_frame(raw)
+                ft = frame_type(frame)
+                if ft == 0:
+                    continue
+                elif ft == 1:
+                    payload = frame_data_payload(frame)
+                    if not payload:
+                        continue
+                    event_data = json.loads(payload.decode("utf-8"))
+                    asyncio.create_task(self._process_event(event_data))
+            except websockets.exceptions.ConnectionClosed:
+                logging.warning("[连接断开]")
+                break
+            except Exception as e:
+                logging.error(f"[读取异常] {e}")
+                traceback.print_exc()
+
+    async def _try_connect(self):
+        url = self._get_ws_url()
+        u = urlparse(url)
+        q = parse_qs(u.query)
+        self.service_id = q.get("service_id", [""])[0]
+        logging.info(f"[WS地址] {url[:80]}...")
+        logging.info(f"[服务ID] {self.service_id}")
+
+        params = inspect.signature(websockets.connect).parameters
+        kwargs = {"proxy": None} if "proxy" in params else {}
+        self._ws = await websockets.connect(url, **kwargs)
+        self._ws_url = url
+        logging.info("[WS已连接]")
+        self._reconnecting = False
+        self._ping_task = asyncio.create_task(self._ping_loop())
+        await self._read_loop()
+
+    async def connect(self):
+        while True:
+            try:
+                await self._try_connect()
+            except Exception as e:
+                logging.error(f"[连接失败] {e}")
+            if self._ws is not None:
+                await self._ws.close()
+                self._ws = None
+            if self._ping_task is not None:
+                self._ping_task.cancel()
+                self._ping_task = None
+            self._reconnecting = True
+            logging.info(f"[重连] {self._reconnect_interval}s 后重试...")
+            await asyncio.sleep(self._reconnect_interval)
+
+    def start(self):
+        asyncio.run(self.connect())
+
+
 # ---- 主入口 ----
 
 def main():
@@ -562,16 +816,7 @@ def main():
     logging.info(f"启动机器人 (App ID: {APP_ID})...")
     logging.info("监听群聊消息中，可直接发送链接到群里测试")
 
-    handler = EventDispatcherHandler.builder("", "") \
-        .register_p2_im_message_receive_v1(on_message_receive) \
-        .build()
-
-    client = WsClient(
-        app_id=APP_ID,
-        app_secret=APP_SECRET,
-        event_handler=handler,
-        log_level=LogLevel.DEBUG,
-    )
+    client = FeishuWsClient(APP_ID, APP_SECRET)
     client.start()
 
 
