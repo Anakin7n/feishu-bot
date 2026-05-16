@@ -4,7 +4,7 @@
 
 飞书群聊机器人，群里发 Excel 链接 → 自动下载 → 解析影片排片数据 → 生成报告文案 → 回复到群里。WebSocket 长连接模式，无需公网 IP。
 
-使用原生 `websockets` + `requests` 替代 lark-oapi SDK，启动从 20+ 秒缩短到 1 秒以内。
+不依赖飞书官方 SDK（`lark-oapi`），使用原生 `websockets` + `requests` + 自写 protobuf 解析器，启动从 20+ 秒缩短到 1 秒以内。
 
 ## 文件结构
 
