@@ -441,6 +441,8 @@ def _is_duplicate(msg_id: str) -> bool:
         _seen_cache.add(msg_id)
         with open(_SEEN_FILE, "a") as f:
             f.write(msg_id + "\n")
+            f.flush()
+            os.fsync(f.fileno())
         if len(_seen_cache) > _SEEN_MAX:
             _trim_seen()
         return False
