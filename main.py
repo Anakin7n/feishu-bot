@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 import traceback
 import urllib.parse
@@ -400,6 +401,7 @@ _SEEN_MAX = 500  # 触发裁剪的阈值
 _SEEN_KEEP = 300  # 裁剪时保留最近条数
 
 _seen_cache: set[str] | None = None
+_seen_lock = threading.RLock()
 
 
 def _init_seen():
@@ -414,33 +416,34 @@ def _init_seen():
 
 
 def _trim_seen():
-    """按文件追加顺序裁剪，保留最近 _SEEN_KEEP 条。"""
-    if not _SEEN_FILE.exists():
-        return
-    with open(_SEEN_FILE, "r") as f:
-        all_lines = [line.strip() for line in f if line.strip()]
-    if len(all_lines) <= _SEEN_MAX:
-        return
-    kept = all_lines[-_SEEN_KEEP:]
-    with open(_SEEN_FILE, "w") as f:
-        for line in kept:
-            f.write(line + "\n")
-    global _seen_cache
-    _seen_cache = set(kept)
+    with _seen_lock:
+        if not _SEEN_FILE.exists():
+            return
+        with open(_SEEN_FILE, "r") as f:
+            all_lines = [line.strip() for line in f if line.strip()]
+        if len(all_lines) <= _SEEN_MAX:
+            return
+        kept = all_lines[-_SEEN_KEEP:]
+        with open(_SEEN_FILE, "w") as f:
+            for line in kept:
+                f.write(line + "\n")
+        global _seen_cache
+        _seen_cache = set(kept)
 
 
 def _is_duplicate(msg_id: str) -> bool:
     global _seen_cache
-    if _seen_cache is None:
-        _init_seen()
-    if msg_id in _seen_cache:
-        return True
-    _seen_cache.add(msg_id)
-    with open(_SEEN_FILE, "a") as f:
-        f.write(msg_id + "\n")
-    if len(_seen_cache) > _SEEN_MAX:
-        _trim_seen()
-    return False
+    with _seen_lock:
+        if _seen_cache is None:
+            _init_seen()
+        if msg_id in _seen_cache:
+            return True
+        _seen_cache.add(msg_id)
+        with open(_SEEN_FILE, "a") as f:
+            f.write(msg_id + "\n")
+        if len(_seen_cache) > _SEEN_MAX:
+            _trim_seen()
+        return False
 
 
 # ---- 事件处理 ----
@@ -518,6 +521,16 @@ def on_message_receive(event_data: dict) -> None:
 
     if _is_duplicate(msg_id):
         return
+
+    create_time_ms = msg.get("create_time", "")
+    if create_time_ms:
+        try:
+            age = time.time() - int(create_time_ms) / 1000
+            if age > 180:
+                logging.info(f"[跳过] 消息过旧 ({age:.0f}s 前)")
+                return
+        except (ValueError, OSError):
+            pass
 
     chat_id = msg.get("chat_id", "")
     msg_type = msg.get("message_type", "")
