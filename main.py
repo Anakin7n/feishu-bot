@@ -6,6 +6,7 @@
 
 import asyncio
 import concurrent.futures
+import hashlib
 import inspect
 import json
 import logging
@@ -448,6 +449,19 @@ def _is_duplicate(msg_id: str) -> bool:
         return False
 
 
+_content_seen: dict[str, float] = {}
+_CONTENT_TTL = 600  # 内容哈希 10 分钟后过期
+
+
+def _is_content_duplicate(content_str: str) -> bool:
+    now = time.time()
+    h = hashlib.sha256(content_str.encode()).hexdigest()
+    if h in _content_seen and now - _content_seen[h] < _CONTENT_TTL:
+        return True
+    _content_seen[h] = now
+    return False
+
+
 # ---- 事件处理 ----
 
 def process_urls(urls: list[str]) -> tuple[str, str] | None:
@@ -548,6 +562,11 @@ def on_message_receive(event_data: dict) -> None:
         return
 
     content_str = msg.get("content", "{}")
+
+    if _is_content_duplicate(content_str):
+        logging.info(f"[跳过] 内容重复")
+        return
+
     logging.info(f"[内容] {content_str}")
 
     try:
