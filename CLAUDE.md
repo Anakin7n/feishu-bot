@@ -10,7 +10,7 @@
 
 ```
 D:\feishu-bot\
-├── main.py              # 机器人主程序（单文件，约 580 行）
+├── main.py              # 机器人主程序（单文件）
 ├── requirements.txt     # Python 依赖
 ├── start.vbs            # 手动启动（双击弹出 PowerShell 蓝窗口，零闪屏）
 ├── start.ps1            # PowerShell 启动脚本
@@ -88,7 +88,10 @@ FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxx
 
 ```
 群聊文本消息 → on_message_receive()
-                ├─ 消息去重（.seen_msg_ids）
+                ├─ message_id 去重（.seen_msg_ids，线程锁 + fsync）
+                ├─ 时间过滤（> 3 分钟跳过）
+                ├─ 内容哈希去重（SHA-256，10 分钟 TTL）
+                ├─ 过滤机器人自产消息
                 ├─ 过滤非文本消息
                 ├─ 提取 URL（支持中英文逗号、分号、换行分隔）
                 │
@@ -127,7 +130,8 @@ FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxx
 | `extract_all_data()` | 提取主电影数据，自动检测对比模式 |
 | `build_message()` | 生成详细数据报告 + 总结跟进语 |
 | `download_file()` | 从 URL 下载 Excel，解析 Content-Disposition 获取文件名 |
-| `_is_duplicate()` | 消息去重，内存 set + 文件持久化，重启不丢失 |
+| `_is_duplicate()` | 消息去重（message_id），内存 set + 文件持久化，fsync 防关机丢失 |
+| `_is_content_duplicate()` | 内容哈希去重（SHA-256），10 分钟 TTL，防 WS 重推不同 message_id 的相同消息 |
 | `calc_deadline()` | 根据提取时间计算截止时间（上午→10点，下午→16点） |
 
 ### 文件名格式
@@ -143,7 +147,20 @@ FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxx
 
 ### 去重机制
 
-启动时从 `.seen_msg_ids` 加载已处理 ID 到内存 set，每次新消息追加写入文件。超过 500 条自动裁剪到 300 条。
+四层防线，防止多台设备错时开机、WS 重连重推等场景下的重复回复：
+
+| 层 | 机制 | 持久化 | 适用场景 |
+|---|------|--------|---------|
+| 1 | `message_id` 去重 | 文件（`.seen_msg_ids`，启动加载 + 即时 fsync） | 同一设备并发/重启回放 |
+| 2 | 时间过滤（3 分钟） | 无 | 跨设备错时开机回放旧消息 |
+| 3 | 内容哈希去重（SHA-256，10 分钟 TTL） | 内存 | WS 重连重推不同 message_id 的相同内容 |
+| 4 | 机器人自产消息过滤 | 无 | 防止回复自己 |
+
+关键实现细节：
+- 第 1 层加 `threading.RLock` 防止并发竞态，`os.fsync` 保证关机不丢数据
+- 第 2 层取 `msg.create_time`（毫秒时间戳）与当前时间比对
+- 第 3 层 TTL 设为 10 分钟，避免误杀用户隔段时间重发的验证消息
+- `.seen_msg_ids` 超过 500 条自动裁剪到 300 条
 
 ### 注意事项
 
