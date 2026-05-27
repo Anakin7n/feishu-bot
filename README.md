@@ -15,8 +15,9 @@ D:\feishu-bot\
 ├── start.vbs            # 手动启动（双击弹出 PowerShell 蓝窗口，零闪屏）
 ├── start.ps1            # PowerShell 启动脚本
 ├── start.bat            # 手动启动（Windows Terminal，有闪屏，备用）
-├── start_auto.bat       # 自启脚本（任务计划调用，无窗口）
+├── start_auto.bat       # 自启脚本（注册表 Run 键调用，无窗口）
 ├── start_silent.vbs     # VBS 静默包装器
+├── install.bat           # 一键安装脚本（移植新设备用）
 ├── .venv/               # Python 虚拟环境（不提交 git）
 ├── .env                 # 飞书应用凭证（不提交 git）
 ├── .gitignore           # Git 忽略规则
@@ -30,12 +31,13 @@ D:\feishu-bot\
 ## 环境要求
 
 - Windows 10+
-- Python 3.12（装在 `%LocalAppData%\Programs\Python\Python312\`，已在系统 PATH）
-- 使用项目自带的虚拟环境（`.venv/`），不依赖系统 Python：
-  ```
-  python -m venv .venv
-  .\.venv\Scripts\pip install -r requirements.txt
-  ```
+- Python 3.12+（安装时勾选 "Add to PATH"）
+- 两种安装依赖的方式：
+
+  | 方式 | 适用场景 | 命令 |
+  |------|---------|------|
+  | 虚拟环境 | 开发/多项目隔离 | `python -m venv .venv` → `.\.venv\Scripts\pip install -r requirements.txt` |
+  | 系统直装 | 只跑这个 bot | `pip install -r requirements.txt` |
 - 飞书应用（需开启机器人能力，订阅 `im.message.receive_v1` 事件）
 
 ## 飞书应用配置
@@ -59,28 +61,29 @@ FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxx
 
 | 方式 | 文件 | 说明 |
 |------|------|------|
-| 手动启动 | `start.vbs` | 双击弹出 PowerShell 蓝窗口，零闪屏 |
-| 自启 | `start_auto.bat` | 任务计划调用，无窗口静默运行 |
-| 备用启动 | `start.bat` | Windows Terminal + PowerShell（有闪屏，备用） |
-| 直接运行 | `.\.venv\Scripts\python.exe main.py` | 使用虚拟环境 Python |
+| 手动启动 | `start.vbs` | 双击弹出 PowerShell 蓝窗口 |
+| 自启 | `start_auto.bat` | 注册表 Run 键调用，无窗口静默运行 |
+| 直接运行 | `python main.py` | 当前目录下命令行启动 |
 
 ## 部署
 
-- **开机自启**：Windows 任务计划 `FeishuBot`，触发条件为当前用户登录时，运行 `start_silent.vbs` → `start_auto.bat`
+- **开机自启**：注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 下 `FeishuBot` 键，值为 `start_silent.vbs` 完整路径。运行 `install.bat` 自动完成，或手动执行：
+  ```powershell
+  Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "FeishuBot" -Value "D:\feishu-bot\start_silent.vbs"
+  ```
+- **取消自启**：
+  ```powershell
+  Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "FeishuBot"
+  ```
 - **日志**：`bot.log`（追加写入，不会自动清理）
 - **停止**：任务管理器结束 python.exe，或 `taskkill /F /IM python.exe`
 
 ## 移植到新设备
 
-1. 复制整个 `feishu-bot\` 文件夹到新设备
-2. 安装 Python 3.12+
-3. 创建虚拟环境并安装依赖：
-   ```
-   python -m venv .venv
-   .\.venv\Scripts\pip install -r requirements.txt
-   ```
-4. 填入飞书凭证到 `.env`
-5. 双击 `start.vbs` 启动
+1. 装 Python 3.12+（python.org 下载，安装时勾选 **Add to PATH**）
+2. 复制整个 `feishu-bot\` 文件夹到新设备（不需要 `.venv`）
+3. 双击 `install.bat`，自动完成：装依赖 → 弹记事本填 `.env` → 注册开机自启
+4. 双击 `start.vbs` 手动启动，或重启电脑自动启动
 
 ## 代码说明
 
