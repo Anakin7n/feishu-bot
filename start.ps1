@@ -1,2 +1,6 @@
 Set-Location (Split-Path -Parent $MyInvocation.MyCommand.Path)
-.\.venv\Scripts\python.exe main.py
+if (Test-Path ".\.venv\Scripts\python.exe") {
+    .\.venv\Scripts\python.exe main.py
+} else {
+    python main.py
+}

@@ -32,12 +32,7 @@ D:\feishu-bot\
 
 - Windows 10+
 - Python 3.12+（安装时勾选 "Add to PATH"）
-- 两种安装依赖的方式：
-
-  | 方式 | 适用场景 | 命令 |
-  |------|---------|------|
-  | 虚拟环境 | 开发/多项目隔离 | `python -m venv .venv` → `.\.venv\Scripts\pip install -r requirements.txt` |
-  | 系统直装 | 只跑这个 bot | `pip install -r requirements.txt` |
+- 启动脚本自动检测：有 `.venv\` 用虚拟环境，没有则用系统 Python
 - 飞书应用（需开启机器人能力，订阅 `im.message.receive_v1` 事件）
 
 ## 飞书应用配置
@@ -58,6 +53,8 @@ FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxx
 ```
 
 ## 入口
+
+启动脚本自动检测环境：有 `.venv\` 用虚拟环境，没有则用系统 Python。
 
 | 方式 | 文件 | 说明 |
 |------|------|------|
@@ -80,10 +77,13 @@ FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxx
 
 ## 移植到新设备
 
-1. 装 Python 3.12+（python.org 下载，安装时勾选 **Add to PATH**）
-2. 复制整个 `feishu-bot\` 文件夹到新设备（不需要 `.venv`）
-3. 双击 `install.bat`，自动完成：装依赖 → 弹记事本填 `.env` → 注册开机自启
-4. 双击 `start.vbs` 手动启动，或重启电脑自动启动
+1. 复制整个 `feishu-bot\` 文件夹到目标设备（不需要 `.venv`）
+2. 安装 Python 3.12+（勾选 "Add Python to PATH"）
+3. 双击 `install.bat`，自动完成：虚拟环境创建 → 依赖安装 → `.env` 模板生成 → 开机自启注册
+4. 编辑 `.env` 填入飞书凭证
+5. 双击 `start.vbs` 启动
+
+> 如果不想用虚拟环境，可跳过第 3 步，直接 `pip install -r requirements.txt`。启动脚本会自动识别。
 
 ## 代码说明
 
