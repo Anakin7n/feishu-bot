@@ -22,7 +22,7 @@ D:\feishu-bot\
 ├── .gitignore           # Git 忽略规则
 ├── .seen_msg_ids        # 消息去重缓存（自动生成）
 ├── bot.log              # 运行日志（自动生成）
-└── CLAUDE.md            # 本文件
+└── README.md            # 本文件
 ```
 
 所有代码自包含在一个目录中，无需外部文件。
