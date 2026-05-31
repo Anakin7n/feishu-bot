@@ -454,12 +454,13 @@ _CONTENT_TTL = 600  # 内容哈希 10 分钟后过期
 
 
 def _is_content_duplicate(content_str: str) -> bool:
-    now = time.time()
-    h = hashlib.sha256(content_str.encode()).hexdigest()
-    if h in _content_seen and now - _content_seen[h] < _CONTENT_TTL:
-        return True
-    _content_seen[h] = now
-    return False
+    with _seen_lock:
+        now = time.time()
+        h = hashlib.sha256(content_str.encode()).hexdigest()
+        if h in _content_seen and now - _content_seen[h] < _CONTENT_TTL:
+            return True
+        _content_seen[h] = now
+        return False
 
 
 # ---- 事件处理 ----
