@@ -564,10 +564,6 @@ def on_message_receive(event_data: dict) -> None:
 
     content_str = msg.get("content", "{}")
 
-    if _is_content_duplicate(content_str):
-        logging.info(f"[跳过] 内容重复")
-        return
-
     logging.info(f"[内容] {content_str}")
 
     try:
@@ -582,6 +578,16 @@ def on_message_receive(event_data: dict) -> None:
 
     text = re.sub(r'@\S+\s*', '', text).strip()
     logging.info(f"[文本] {text}")
+
+    # 检测 "test" 前缀：testhttps://... 或 test https://... 形式跳过内容去重
+    skip_content_dedup = bool(re.search(r'test\s*https?://', text, re.IGNORECASE))
+    if skip_content_dedup:
+        text = re.sub(r'test\s*(https?://)', r'\1', text, flags=re.IGNORECASE)
+        logging.info("[test模式] 跳过内容去重")
+
+    if not skip_content_dedup and _is_content_duplicate(content_str):
+        logging.info(f"[跳过] 内容重复")
+        return
 
     text = text.replace("；", " ").replace("，", " ").replace(",", " ").replace("\n", " ")
     urls = re.findall(r"https?://[^\s]+", text)
