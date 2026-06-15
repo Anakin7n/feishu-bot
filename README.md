@@ -22,7 +22,7 @@ D:\feishu-bot\
 ├── .env                 # 飞书应用凭证（不提交 git）
 ├── .gitignore           # Git 忽略规则
 ├── .seen_msg_ids        # 消息去重缓存（自动生成）
-├── bot.log              # 运行日志（自动生成）
+├── bot.log              # 运行日志（自动轮转，5MB × 4 个文件）
 └── README.md            # 本文件
 ```
 
@@ -74,7 +74,7 @@ FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxx
   ```powershell
   Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "FeishuBot"
   ```
-- **日志**：`bot.log`（追加写入，不会自动清理）
+- **日志**：`bot.log`（自动轮转，超过 5MB 切分，保留最近 3 个历史文件）
 - **停止**：任务管理器结束 python.exe，或 `taskkill /F /IM python.exe`
 
 ## 移植到新设备

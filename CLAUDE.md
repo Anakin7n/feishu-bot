@@ -64,5 +64,5 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 - 用 `.venv` 虚拟环境，不要全局 pip install
 - 跑起来：`.venv\Scripts\python.exe main.py`
-- 日志：`bot.log`（追加写入，不自动清理）
+- 日志：`bot.log`（自动轮转，> 5MB 切分，保留 3 个历史文件）
 - 不要修改启动脚本（.vbs/.bat/.ps1），那是用户特意配置的

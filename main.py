@@ -17,6 +17,7 @@ import threading
 import time
 import traceback
 import urllib.parse
+from logging.handlers import RotatingFileHandler
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -83,7 +84,12 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
-        logging.FileHandler(Path(__file__).parent / "bot.log", encoding="utf-8"),
+        RotatingFileHandler(
+            Path(__file__).parent / "bot.log",
+            maxBytes=5 * 1024 * 1024,  # 5MB
+            backupCount=3,
+            encoding="utf-8",
+        ),
         logging.StreamHandler(sys.stdout),
     ],
 )
