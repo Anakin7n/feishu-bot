@@ -372,7 +372,11 @@ def download_file(url: str) -> tuple[str | None, bytes | None]:
                     _, fname_encoded = encoded.split("''", 1)
                     fname = urllib.parse.unquote(fname_encoded)
         if not fname and "filename=" in cd:
-            fname = cd.split("filename=")[1].strip().strip('"')
+            raw = cd.split("filename=")[1].split(";")[0].strip().strip('"')
+            try:
+                fname = raw.encode("latin-1").decode("utf-8")
+            except (UnicodeDecodeError, UnicodeEncodeError):
+                fname = raw
         if not fname:
             fname = url.split("/")[-1].split("?")[0]
 
@@ -380,6 +384,73 @@ def download_file(url: str) -> tuple[str | None, bytes | None]:
     except Exception as e:
         logging.error(f"下载失败: {e}")
         return None, None
+
+
+# ---- 飞书文件下载 ----
+
+def download_feishu_file(message_id: str, file_key: str) -> tuple[str | None, bytes | None, str | None]:
+    """下载飞书消息中的文件附件，返回 (文件名, 内容, 错误信息)。"""
+    def _parse_feishu_error(resp) -> str:
+        """从飞书错误响应中提取 msg，提取不到返回空字符串。"""
+        try:
+            body = resp.json()
+            return f"（{body.get('msg', '')}）"
+        except Exception:
+            return ""
+
+    try:
+        resp = requests.get(
+            f"{_FEISHU_DOMAIN}/open-apis/im/v1/messages/{message_id}/resources/{file_key}",
+            params={"type": "file"},
+            headers={"Authorization": f"Bearer {_get_token()}"},
+            timeout=60,
+        )
+
+        if resp.status_code == 200:
+            fname = None
+            cd = resp.headers.get("Content-Disposition", "")
+
+            # RFC 5987: filename*=UTF-8''percent-encoded
+            if "filename*=" in cd:
+                parts = cd.split("filename*=")
+                if len(parts) > 1:
+                    encoded = parts[1].split(";")[0].strip()
+                    if "''" in encoded:
+                        _, fname_encoded = encoded.split("''", 1)
+                        fname = urllib.parse.unquote(fname_encoded)
+
+            # Fallback: filename="..."
+            if not fname and "filename=" in cd:
+                raw = cd.split("filename=")[1].split(";")[0].strip().strip('"')
+                # 飞书可能把 UTF-8 字节直接塞进 filename= 字段，
+                # requests 按 HTTP 标准用 Latin-1 解码了头字段，导致中文变乱码。
+                # 尝试 Latin-1 → bytes → UTF-8 还原。
+                try:
+                    fname = raw.encode("latin-1").decode("utf-8")
+                except (UnicodeDecodeError, UnicodeEncodeError):
+                    fname = raw
+
+            if not fname:
+                fname = file_key + ".xlsx"
+            return fname, resp.content, None
+
+        # 非 200：解析飞书错误信息
+        feishu_err = _parse_feishu_error(resp)
+        if resp.status_code == 404:
+            return None, None, f"文件已过期或不存在{feishu_err}，请重新发送"
+        if resp.status_code == 403:
+            return None, None, f"权限不足{feishu_err}，请确认应用已开通 im:resource 权限"
+        if resp.status_code == 400:
+            return None, None, f"文件无法下载{feishu_err}，文件可能已失效或不支持下载（如转发消息中的文件）"
+        return None, None, f"下载失败（HTTP {resp.status_code}{feishu_err}），请重试"
+    except requests.Timeout:
+        return None, None, "下载超时，请重试"
+    except requests.RequestException as e:
+        logging.error(f"下载飞书文件失败: {e}")
+        return None, None, "网络异常，下载失败，请重试"
+    except Exception as e:
+        logging.error(f"下载飞书文件失败: {e}")
+        return None, None, "下载失败，请重试"
 
 
 # ---- 消息发送 ----
@@ -463,11 +534,95 @@ def _is_content_duplicate(content_str: str) -> bool:
         return False
 
 
+# ---- 文件消息累积 ----
+
+_pending_file: dict[str, dict] = {}  # chat_id -> entry (等待配对的第一个文件)
+_pending_timers: dict[str, threading.Timer] = {}
+_pending_lock = threading.Lock()
+_FILE_WAIT_SECONDS = 5  # 等第二个文件的超时时间
+
+
+def _on_file_timeout(chat_id: str):
+    """5 秒内没收到第二个文件，提醒用户（文件继续暂存）。"""
+    logging.info(f"[文件提醒] chat_id={chat_id} 未收到第二个文件，继续等待")
+    send_message(chat_id, "仍需要一个 Excel 文件，请继续发送第二个文件")
+    # 重新计时
+    with _pending_lock:
+        if chat_id in _pending_file:
+            timer = threading.Timer(_FILE_WAIT_SECONDS, _on_file_timeout, args=[chat_id])
+            timer.daemon = True
+            _pending_timers[chat_id] = timer
+            timer.start()
+
+
+def _process_two_files(chat_id: str, entry1: dict, entry2: dict):
+    """两个文件到齐，合并生成文案。"""
+    entries = [entry1, entry2]
+    entries.sort(key=lambda e: e["mon_start"])
+    logging.info("两个文件到齐，生成文案")
+    main_msg, summary_msg = build_message(entries)
+    send_message(chat_id, main_msg)
+    time.sleep(0.5)
+    send_message(chat_id, summary_msg)
+
+
 # ---- 事件处理 ----
 
+def _parse_single_file(fname: str, content: bytes) -> dict | None:
+    """解析单个 Excel 文件，返回 entry dict 或 None。"""
+    safe_name = re.sub(r'[<>:"/\\|?*]', '_', fname)
+    logging.info(f"文件: {safe_name}")
+
+    info = parse_filename(safe_name)
+    if info is None:
+        logging.warning(f"文件名格式不匹配: {safe_name}")
+        return None
+
+    logging.info(f"影片: {info['movie']}  监控: {info['mon_start']} ~ {info['mon_end']}")
+
+    try:
+        wb = openpyxl.load_workbook(BytesIO(content), data_only=True)
+    except Exception as e:
+        logging.warning(f"Excel 文件打开失败: {e}")
+        return None
+
+    sheet_name = find_data_sheet(wb)
+    if sheet_name is None:
+        logging.warning(f"未找到数据 Sheet，可用: {wb.sheetnames}")
+        wb.close()
+        return None
+
+    ws = wb[sheet_name]
+    logging.info(f"Sheet: {sheet_name}  (max_row={ws.max_row}, max_col={ws.max_column})")
+    header_row = find_header_row(ws)
+    if header_row is None:
+        logging.warning("未找到表头")
+        wb.close()
+        return None
+
+    logging.info(f"表头行: {header_row}")
+
+    all_data = extract_all_data(ws, header_row, info["movie"])
+    wb.close()
+
+    if all_data is None:
+        logging.warning("数据提取失败")
+        return None
+
+    info["data"] = all_data["data"]
+    if all_data["cmp_movie"]:
+        info["cmp_movie"] = all_data["cmp_movie"]
+        info["cmp_data"] = all_data["cmp_data"]
+
+    logging.info(f"数据: {info['data']}")
+    if info.get("cmp_movie"):
+        logging.info(f"对比: {info['cmp_movie']} -> {info['cmp_data']}")
+    return info
+
+
 def process_urls(urls: list[str]) -> tuple[str, str] | None:
-    """下载、解析、生成文案。"""
-    logging.info("开始处理...")
+    """下载链接中的 Excel 并解析，至少需要 2 个有效文件。"""
+    logging.info("开始处理链接...")
     entries = []
 
     for url in urls:
@@ -477,50 +632,9 @@ def process_urls(urls: list[str]) -> tuple[str, str] | None:
             logging.warning("下载失败")
             continue
 
-        safe_name = re.sub(r'[<>:"/\\|?*]', '_', fname)
-        logging.info(f"文件: {safe_name}")
-
-        info = parse_filename(safe_name)
-        if info is None:
-            logging.warning(f"文件名格式不匹配: {safe_name}")
-            continue
-
-        logging.info(f"影片: {info['movie']}  监控: {info['mon_start']} ~ {info['mon_end']}")
-
-        wb = openpyxl.load_workbook(BytesIO(content), data_only=True)
-
-        sheet_name = find_data_sheet(wb)
-        if sheet_name is None:
-            logging.warning(f"未找到数据 Sheet，可用: {wb.sheetnames}")
-            wb.close()
-            continue
-
-        ws = wb[sheet_name]
-        logging.info(f"Sheet: {sheet_name}  (max_row={ws.max_row}, max_col={ws.max_column})")
-        header_row = find_header_row(ws)
-        if header_row is None:
-            logging.warning("未找到表头")
-            wb.close()
-            continue
-
-        logging.info(f"表头行: {header_row}")
-
-        all_data = extract_all_data(ws, header_row, info["movie"])
-        wb.close()
-
-        if all_data is None:
-            logging.warning("数据提取失败")
-            continue
-
-        info["data"] = all_data["data"]
-        if all_data["cmp_movie"]:
-            info["cmp_movie"] = all_data["cmp_movie"]
-            info["cmp_data"] = all_data["cmp_data"]
-
-        logging.info(f"数据: {info['data']}")
-        if info.get("cmp_movie"):
-            logging.info(f"对比: {info['cmp_movie']} -> {info['cmp_data']}")
-        entries.append(info)
+        entry = _parse_single_file(fname, content)
+        if entry:
+            entries.append(entry)
 
     if len(entries) < 2:
         logging.warning(f"至少需要 2 个有效文件，当前只有 {len(entries)} 个")
@@ -558,11 +672,67 @@ def on_message_receive(event_data: dict) -> None:
 
     logging.info(f"[事件] chat_id={chat_id}  msg_type={msg_type}")
 
-    if msg_type != "text":
-        logging.info(f"[跳过] 非文本消息: {msg_type}")
+    content_str = msg.get("content", "{}")
+
+    # ---- 文件消息处理 ----
+    if msg_type == "file":
+        try:
+            content_json = json.loads(content_str)
+            file_key = content_json.get("file_key", "")
+        except (json.JSONDecodeError, AttributeError):
+            file_key = ""
+
+        if not file_key:
+            logging.info("[跳过] 文件消息缺少 file_key")
+            return
+
+        if _is_content_duplicate(content_str):
+            logging.info(f"[跳过] 内容重复 (file)")
+            return
+
+        logging.info(f"[文件消息] file_key={file_key}")
+        fname, content, err = download_feishu_file(msg_id, file_key)
+        if err:
+            logging.warning(f"文件下载失败: {err}")
+            send_message(chat_id, err)
+            return
+
+        # 预检：确保能解析
+        entry = _parse_single_file(fname, content)
+        if entry is None:
+            send_message(chat_id, "文件处理失败：请确认文件名格式正确，且包含数据 Sheet")
+            return
+
+        # 检查是否有待配对的第一个文件
+        first_entry = None
+        timer_to_cancel = None
+        with _pending_lock:
+            if chat_id in _pending_file:
+                first_entry = _pending_file.pop(chat_id)
+                timer_to_cancel = _pending_timers.pop(chat_id, None)
+
+        if timer_to_cancel:
+            timer_to_cancel.cancel()
+
+        if first_entry is not None:
+            # 第二个文件到齐，立即处理
+            _process_two_files(chat_id, first_entry, entry)
+            return
+
+        # 第一个文件：暂存，启动 5 秒超时
+        with _pending_lock:
+            _pending_file[chat_id] = entry
+            timer = threading.Timer(_FILE_WAIT_SECONDS, _on_file_timeout, args=[chat_id])
+            timer.daemon = True
+            _pending_timers[chat_id] = timer
+            timer.start()
+
+        logging.info(f"[文件累积] chat_id={chat_id} 收到第 1 个文件，等待第 2 个（{_FILE_WAIT_SECONDS}s 超时）")
         return
 
-    content_str = msg.get("content", "{}")
+    if msg_type != "text":
+        logging.info(f"[跳过] 非文本/文件消息: {msg_type}")
+        return
 
     logging.info(f"[内容] {content_str}")
 
@@ -850,6 +1020,35 @@ class FeishuWsClient:
 # ---- 主入口 ----
 
 def main():
+    # CLI 模式：直接传文件路径，不启动 WebSocket
+    if len(sys.argv) > 1:
+        file_list = []
+        for arg in sys.argv[1:]:
+            p = Path(arg)
+            if not p.exists():
+                print(f"文件不存在: {arg}")
+                sys.exit(1)
+            with open(p, "rb") as f:
+                content = f.read()
+            file_list.append((p.name, content))
+
+        entries = []
+        for fname, content in file_list:
+            entry = _parse_single_file(fname, content)
+            if entry:
+                entries.append(entry)
+
+        if not entries:
+            print("没有成功解析的文件")
+            sys.exit(1)
+
+        entries.sort(key=lambda e: e["mon_start"])
+        main_msg, summary_msg = build_message(entries)
+        print(main_msg)
+        print("---")
+        print(summary_msg)
+        return
+
     if not APP_ID or not APP_SECRET:
         logging.error("请先在 .env 中配置 FEISHU_APP_ID 和 FEISHU_APP_SECRET")
         sys.exit(1)

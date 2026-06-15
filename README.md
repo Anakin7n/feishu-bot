@@ -2,7 +2,7 @@
 
 ## 概述
 
-飞书群聊机器人，群里发 Excel 链接 → 自动下载 → 解析影片排片数据 → 生成报告文案 → 回复到群里。WebSocket 长连接模式，无需公网 IP。
+飞书群聊机器人，三种方式喂 Excel：① 群聊发链接（自动下载）② 群聊直接发文件 ③ 命令行传本地文件。解析影片排片数据 → 生成报告文案 → 回复到群里。WebSocket 长连接模式，无需公网 IP。
 
 不依赖飞书官方 SDK（`lark-oapi`），使用原生 `websockets` + `requests` + 自写 protobuf 解析器，启动从 20+ 秒缩短到 1 秒以内。
 
@@ -62,6 +62,7 @@ FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxx
 | 手动启动 | `start.vbs` | 双击弹出 PowerShell 蓝窗口 |
 | 自启 | `start_auto.bat` | 注册表 Run 键调用，无窗口静默运行 |
 | 直接运行 | `python main.py` | 当前目录下命令行启动 |
+| CLI 测试 | `python main.py a.xlsx b.xlsx` | 直接传入本地文件，打印报告后退出 |
 
 ## 部署
 
@@ -91,29 +92,29 @@ FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxx
 ### 消息流程
 
 ```
-群聊文本消息 → on_message_receive()
-                ├─ message_id 去重（.seen_msg_ids，线程锁 + fsync）
-                ├─ 时间过滤（> 3 分钟跳过）
-                ├─ 内容哈希去重（SHA-256，10 分钟 TTL）
-                ├─ 过滤机器人自产消息
-                ├─ 过滤非文本消息
-                ├─ 提取 URL（支持中英文逗号、分号、换行分隔）
-                │
-                ▼
-              process_urls()
-                ├─ download_file() → 下载 Excel
-                ├─ parse_filename() → 正则解析文件名
-                ├─ find_data_sheet() → 智能定位数据 Sheet
-                ├─ find_header_row() → 定位表头行
-                ├─ extract_all_data() → 提取主电影 + 对比电影数据
-                │
-                ▼
-              build_message() → 生成两条文案
-                ├─ 第1条：详细数据报告
-                └─ 第2条：总结跟进语
-                │
-                ▼
-              send_message() × 2 → 飞书 API 回复到群聊
+群聊消息 → on_message_receive()
+             ├─ message_id 去重（.seen_msg_ids，线程锁 + fsync）
+             ├─ 时间过滤（> 3 分钟跳过）
+             ├─ 内容哈希去重（SHA-256，10 分钟 TTL）
+             ├─ 过滤机器人自产消息
+             │
+             ├─ msg_type = "text"           msg_type = "file"
+             │   提取 URL                    download_feishu_file()
+             │   process_urls()              累积配对（等第二个文件，5s 超时提醒）
+             │      download_file()           │
+             │      _parse_single_file()  ←──┘
+             │         parse_filename()
+             │         find_data_sheet()
+             │         find_header_row()
+             │         extract_all_data()
+             │
+             ▼
+           build_message() → 生成两条文案
+             ├─ 第1条：详细数据报告
+             └─ 第2条：总结跟进语
+             │
+             ▼
+           send_message() × 2 → 飞书 API 回复到群聊
 ```
 
 ### 关键函数
@@ -134,6 +135,10 @@ FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxx
 | `extract_all_data()` | 提取主电影数据，自动检测对比模式 |
 | `build_message()` | 生成详细数据报告 + 总结跟进语 |
 | `download_file()` | 从 URL 下载 Excel，解析 Content-Disposition 获取文件名 |
+| `download_feishu_file()` | 从飞书消息下载文件附件（调用资源 API），解析错误码返回具体提示 |
+| `_parse_single_file()` | 解析单个 Excel 文件（文件名 + 内容），供 URL / 文件消息 / CLI 三路复用 |
+| `_process_two_files()` | 两个文件到齐后合并排序，调用 build_message 生成一份文案 |
+| `_on_file_timeout()` | 文件消息 5 秒未凑齐两个时提醒用户，文件继续暂存不丢弃 |
 | `_is_duplicate()` | 消息去重（message_id），内存 set + 文件持久化，fsync 防关机丢失 |
 | `_is_content_duplicate()` | 内容哈希去重（SHA-256），10 分钟 TTL，防 WS 重推不同 message_id 的相同消息 |
 | `calc_deadline()` | 根据提取时间计算截止时间（上午→10点，下午→16点） |
@@ -169,6 +174,8 @@ FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxx
 ### 注意事项
 
 - 两个 Excel 一组（同电影两个监控时段，按 `mon_start` 排序），缺一则返回错误提示
+- 文件消息模式：发送第一个文件后暂存，等第二个文件到齐后合并处理；每 5 秒提醒一次，文件不丢失
+- CLI 模式：`python main.py a.xlsx b.xlsx`，直接打报告到终端
 - 文件名格式必须严格匹配正则，否则跳过
 - 密钥走 `.env`，不硬编码，不提交 git
 - URL 支持中文逗号、英文逗号（带或不带空格）、中文分号、换行分隔
